@@ -112,7 +112,8 @@ jobs:
       - name: Build through hushrun
         run: |
           start=$(date +%s.%N)
-          HUSHRUN_BUILD=on hushrun run build -- cargo build --release --locked 2>&1 | tee "$RUNNER_TEMP/build.log"
+          # Each compile's key parts, to compare with the containers' (session.rs KEY_LOG).
+          HUSHRUN_BUILD_KEY_LOG="$RUNNER_TEMP/keys-runner.jsonl" HUSHRUN_BUILD=on hushrun run build -- cargo build --release --locked 2>&1 | tee "$RUNNER_TEMP/build.log"
           echo "build wall seconds: $(echo "$(date +%s.%N) - $start" | awk '{print $1 - $3}')" | tee -a "$RUNNER_TEMP/build.log"
           hushrun build status 2>&1 | tee -a "$RUNNER_TEMP/build.log"
           hushrun build manifest 2>&1 | tee -a "$RUNNER_TEMP/build.log"
@@ -130,11 +131,20 @@ jobs:
         continue-on-error: true
         run: hushrun build bake --from store --out "$RUNNER_TEMP/report-store" --report -- cargo build --release --locked 2>&1 | tee "$RUNNER_TEMP/report.log"
 
+      - name: Keep the key log, unless it names a credential
+        if: always()
+        run: |
+          if grep -qE 'ACTIONS_ID_TOKEN|ACTIONS_RUNTIME|ghs_|GITHUB_TOKEN' "$RUNNER_TEMP/keys-runner.jsonl"; then
+            echo "the key log names a credential: not kept"; rm -f "$RUNNER_TEMP/keys-runner.jsonl"
+          fi
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: store
-          path: ${{ runner.temp }}/*.log
+          path: |
+            ${{ runner.temp }}/*.log
+            ${{ runner.temp }}/keys-runner.jsonl
 
   verify:
     needs: bake
@@ -280,7 +290,8 @@ jobs:
           for v in cold deps full paths rustup; do
             echo "::group::$v"
             start=$(date +%s.%N)
-            docker run --rm --name "hushrun-snap-gh-$v" "hushrun-snap-gh-$v" /boot.sh 2>&1 | tee "$RUNNER_TEMP/$v.log"
+            mkdir -p "$RUNNER_TEMP/keys-$v" && chmod 777 "$RUNNER_TEMP/keys-$v"
+            docker run --rm --name "hushrun-snap-gh-$v" -v "$RUNNER_TEMP/keys-$v:/keys" "hushrun-snap-gh-$v" /boot.sh 2>&1 | tee "$RUNNER_TEMP/$v.log"
             echo "container wall seconds: $(echo "$(date +%s.%N) - $start" | awk '{print $1 - $3}')" | tee -a "$RUNNER_TEMP/$v.log"
             echo "::endgroup::"
           done
@@ -296,4 +307,6 @@ jobs:
         if: always()
         with:
           name: boot
-          path: ${{ runner.temp }}/*.log
+          path: |
+            ${{ runner.temp }}/*.log
+            ${{ runner.temp }}/keys-*/keys.jsonl

@@ -11,7 +11,7 @@ cargo fetch --locked -q
 echo '// changed in the sandbox' >> src/main.rs
 git diff --stat
 start=$(date +%s.%N)
-HUSHRUN_BUILD=on hushrun run build -- cargo build --release --locked
+HUSHRUN_BUILD_KEY_LOG=/keys/keys.jsonl HUSHRUN_BUILD=on hushrun run build -- cargo build --release --locked
 end=$(date +%s.%N)
 echo "build wall seconds: $(echo "$end - $start" | awk '{print $1 - $3}')"
 ./target/release/bake-demo "a=1 b=2"
