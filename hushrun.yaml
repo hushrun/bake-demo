@@ -1,0 +1,10 @@
+# hushrun.yaml: this repository has no backend; results and compiled code stay on the runner.
+version: 1
+repository: github.com/hushrun/bake-demo
+
+build:
+  baked:
+    # A run trusts a baked store or image only when this workflow on main signed it.
+    signers:
+      - issuer: https://token.actions.githubusercontent.com
+        subject: https://github.com/hushrun/bake-demo/.github/workflows/bake.yml@refs/heads/main

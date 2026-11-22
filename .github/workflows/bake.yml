@@ -1,0 +1,234 @@
+# Builds through hushrun, bakes the job's store into a layered image on GHCR signed keylessly,
+# verifies the signature from outside with cosign, and boots a container warm from the image.
+name: bake
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+# Two bakes of one repository at once race for the moving tag (B-65): one at a time.
+concurrency:
+  group: bake
+  cancel-in-progress: false
+
+env:
+  # No hosted backend: results and compiled code stay on the runner.
+  HUSHRUN_BACKEND: ""
+  HUSHRUN_NO_UPDATE_CHECK: "1"
+  HUSHRUN_REV: 623f73285383bb2d8dbd651f1e442a6eb086acbd
+  IMAGE: ghcr.io/hushrun/bake-demo
+  RUST_IMAGE: rust:1.94.0-trixie
+
+jobs:
+  bake:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache the hushrun binary
+        id: hushrun-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/hushrun
+          key: hushrun-bin-${{ runner.os }}-${{ env.HUSHRUN_REV }}-rust-1.94.0
+
+      - name: Install hushrun
+        if: steps.hushrun-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked --git https://github.com/hushrun/hushrun --rev "$HUSHRUN_REV" hushrun
+
+      - name: Toolchain
+        run: |
+          hushrun --version
+          rustc -vV
+          echo "glibc: $(ldd --version | head -1)"
+
+      - name: Build through hushrun
+        run: |
+          start=$(date +%s.%N)
+          HUSHRUN_BUILD=on hushrun run build -- cargo build --release --locked 2>&1 | tee "$RUNNER_TEMP/build.log"
+          end=$(date +%s.%N)
+          echo "build wall seconds: $(echo "$end - $start" | awk '{print $1 - $3}')" | tee -a "$RUNNER_TEMP/build.log"
+          hushrun build status 2>&1 | tee -a "$RUNNER_TEMP/build.log"
+          hushrun build manifest 2>&1 | tee -a "$RUNNER_TEMP/build.log"
+
+      - name: Bake and publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          # --force: a demo publishes every push, even within the hour of the last image (B-66's hold).
+          start=$(date +%s.%N)
+          hushrun build bake --from store --oci "$IMAGE" --force 2>&1 | tee "$RUNNER_TEMP/bake.log"
+          end=$(date +%s.%N)
+          echo "bake wall seconds: $(echo "$end - $start" | awk '{print $1 - $3}')" | tee -a "$RUNNER_TEMP/bake.log"
+
+      - name: What the store saves on this runner
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          hushrun build bake --from store --out "$RUNNER_TEMP/report-store" --report -- cargo build --release --locked 2>&1 | tee "$RUNNER_TEMP/report.log"
+
+      - name: Keep the binary and the logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          cp ~/.cargo/bin/hushrun "$RUNNER_TEMP/out/" || true
+          cp "$RUNNER_TEMP"/*.log "$RUNNER_TEMP/out/" || true
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bake
+          path: ${{ runner.temp }}/out
+
+  verify:
+    needs: bake
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      IDENTITY: ^https://github\.com/hushrun/bake-demo/\.github/workflows/bake\.yml@refs/heads/main$
+      ISSUER: https://token.actions.githubusercontent.com
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: bake
+          path: ${{ runner.temp }}/bake
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: Log in to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Verify the image's attestation with cosign
+        run: |
+          set -x
+          cosign version
+          digest="sha256:$(docker buildx imagetools inspect --raw "$IMAGE:hushrun-linux-x64-latest" | sha256sum | cut -d' ' -f1)"
+          echo "digest=$digest" >> "$GITHUB_ENV"
+          docker buildx imagetools inspect --raw "$IMAGE:hushrun-linux-x64-latest" | jq .
+          cosign verify-attestation --new-bundle-format --insecure-ignore-tlog \
+            --type https://hushrun.com/attestations/baked-image/v1 \
+            --certificate-identity-regexp "$IDENTITY" \
+            --certificate-oidc-issuer "$ISSUER" \
+            "$IMAGE@$digest" > "$RUNNER_TEMP/image-attestation.json"
+          jq -r '.payload' "$RUNNER_TEMP/image-attestation.json" | head -1 | base64 -d | jq .
+
+      - name: The same check must fail for another identity
+        run: |
+          if cosign verify-attestation --new-bundle-format --insecure-ignore-tlog \
+            --type https://hushrun.com/attestations/baked-image/v1 \
+            --certificate-identity-regexp '^https://github\.com/hushrun/bake-demo/\.github/workflows/bake\.yml@refs/heads/other$' \
+            --certificate-oidc-issuer "$ISSUER" \
+            "$IMAGE@$digest" > /dev/null; then
+            echo "verified for the wrong identity"; exit 1
+          fi
+          echo "refused for the wrong identity, as it should be"
+
+      - name: Pull the store and verify baked.json's attestation
+        run: |
+          set -x
+          docker pull "$IMAGE@$digest"
+          docker create --name hushrun-snap-gh-store "$IMAGE@$digest" /none
+          docker cp hushrun-snap-gh-store:/hushrun "$RUNNER_TEMP/pulled"
+          docker rm hushrun-snap-gh-store
+          ls -la "$RUNNER_TEMP/pulled"
+          du -sh "$RUNNER_TEMP/pulled"
+          jq '{trust, source, repository, platform, manifest, checks, toolchains, rows: (.packs // .rows | length)}' "$RUNNER_TEMP/pulled/baked.json" || jq 'del(.packs)' "$RUNNER_TEMP/pulled/baked.json"
+          cosign verify-blob-attestation --new-bundle-format --insecure-ignore-tlog \
+            --bundle "$RUNNER_TEMP/pulled/baked.sigstore.json" \
+            --type https://hushrun.com/attestations/baked-store/v1 \
+            --certificate-identity-regexp "$IDENTITY" \
+            --certificate-oidc-issuer "$ISSUER" \
+            "$RUNNER_TEMP/pulled/baked.json"
+
+      - name: hushrun reads the pulled store
+        run: |
+          install -m 0755 "$RUNNER_TEMP/bake/hushrun" /usr/local/bin/hushrun 2>/dev/null || sudo install -m 0755 "$RUNNER_TEMP/bake/hushrun" /usr/local/bin/hushrun
+          chmod -R go-w "$RUNNER_TEMP/pulled"
+          HUSHRUN_BUILD_LOWER="$RUNNER_TEMP/pulled" hushrun build status
+          HUSHRUN_BUILD_LOWER="$RUNNER_TEMP/pulled" hushrun build status --format json | jq '.baked // .'
+
+  boot:
+    # GitHub's runner stands in for a sandbox provider here: a container started from the image
+    # with the baked store, against the same container with none.
+    needs: bake
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: bake
+          path: ${{ runner.temp }}/bake
+
+      - name: Log in to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: The image's layout
+        run: |
+          docker buildx imagetools inspect --raw "$IMAGE:hushrun-linux-x64-latest" | jq '{mediaType, layers: [.layers[] | {digest, size, role: .annotations["dev.hushrun.layer"]}]}'
+
+      - name: Build the cold and warm images
+        run: |
+          ctx="$RUNNER_TEMP/ctx"
+          mkdir -p "$ctx"
+          cp -a "$GITHUB_WORKSPACE" "$ctx/repo"
+          install -m 0755 "$RUNNER_TEMP/bake/hushrun" "$ctx/hushrun"
+          install -m 0755 ci/boot.sh "$ctx/boot.sh"
+          {
+            echo "FROM $RUST_IMAGE"
+            echo "COPY hushrun /usr/local/bin/hushrun"
+            echo "COPY repo /home/runner/work/bake-demo/bake-demo"
+            echo "COPY boot.sh /boot.sh"
+            echo 'ENV HUSHRUN_BACKEND="" HUSHRUN_HOST=http://127.0.0.1:9 HUSHRUN_NO_UPDATE_CHECK=1'
+          } > "$ctx/Dockerfile.cold"
+          {
+            echo "FROM $RUST_IMAGE"
+            echo "COPY --from=$IMAGE:hushrun-linux-x64-latest /hushrun /hushrun"
+            tail -n +2 "$ctx/Dockerfile.cold"
+          } > "$ctx/Dockerfile.warm"
+          cat "$ctx/Dockerfile.warm"
+          docker build -q -t hushrun-snap-gh-cold -f "$ctx/Dockerfile.cold" "$ctx"
+          docker build -t hushrun-snap-gh-warm -f "$ctx/Dockerfile.warm" "$ctx"
+
+      - name: Cold, no baked store
+        run: |
+          set -o pipefail
+          start=$(date +%s.%N)
+          docker run --rm --name hushrun-snap-gh-cold hushrun-snap-gh-cold /boot.sh 2>&1 | tee "$RUNNER_TEMP/cold.log"
+          echo "container wall seconds: $(echo "$(date +%s.%N) - $start" | awk '{print $1 - $3}')" | tee -a "$RUNNER_TEMP/cold.log"
+
+      - name: Warm, from the baked store
+        run: |
+          set -o pipefail
+          start=$(date +%s.%N)
+          docker run --rm --name hushrun-snap-gh-warm hushrun-snap-gh-warm /boot.sh 2>&1 | tee "$RUNNER_TEMP/warm.log"
+          echo "container wall seconds: $(echo "$(date +%s.%N) - $start" | awk '{print $1 - $3}')" | tee -a "$RUNNER_TEMP/warm.log"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### cold'; echo '```'; grep -E 'hushrun: build|wall seconds|Finished' "$RUNNER_TEMP/cold.log" || true; echo '```'
+            echo '### warm'; echo '```'; grep -E 'hushrun: build|baked|wall seconds|Finished' "$RUNNER_TEMP/warm.log" || true; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

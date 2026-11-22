@@ -1,0 +1,4 @@
+[toolchain]
+# The same Rust as the rust:1.94.0-trixie image the boot job starts from.
+channel = "1.94.0"
+profile = "minimal"
