@@ -3,7 +3,7 @@ use std::io::Read;
 use anyhow::Context;
 use clap::Parser;
 
-/// Prints the `key=value` pairs of a text as JSON.
+/// Prints the `key=value` pairs of a text as pretty JSON.
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
