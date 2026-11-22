@@ -240,6 +240,18 @@ jobs:
             printf '%s' "$raw" | jq -c '.layers[] | {role: .annotations["dev.hushrun.layer"], size, digest}'
           done
 
+      - name: Which files of the two images' deps layers differ
+        run: |
+          for tag in hushrun-linux-x64-latest hushrun-linux-x64-branch-main-latest; do
+            docker pull -q "$IMAGE:$tag" > /dev/null
+            docker inspect --format '{{json .Config.Labels}}' "$IMAGE:$tag" | jq -r '.["dev.hushrun.baked-image"]' > "$RUNNER_TEMP/$tag.label.json"
+            jq -c '[.layers[] | {role, files: (.files | length)}]' "$RUNNER_TEMP/$tag.label.json"
+            jq -r '.layers[] | select(.role == "deps") | .files[] | [.path, (.size | tostring), (.sha256 // .digest // "")] | join(" ")' "$RUNNER_TEMP/$tag.label.json" | sort > "$RUNNER_TEMP/$tag.deps.txt"
+          done
+          head -2 "$RUNNER_TEMP/hushrun-linux-x64-latest.deps.txt"
+          echo "deps files whose bytes differ: $(diff "$RUNNER_TEMP/hushrun-linux-x64-latest.deps.txt" "$RUNNER_TEMP/hushrun-linux-x64-branch-main-latest.deps.txt" | grep -c '^<' || true) of $(wc -l < "$RUNNER_TEMP/hushrun-linux-x64-latest.deps.txt")"
+          diff "$RUNNER_TEMP/hushrun-linux-x64-latest.deps.txt" "$RUNNER_TEMP/hushrun-linux-x64-branch-main-latest.deps.txt" | head -20 || true
+
       - name: Build the images
         run: |
           ctx="$RUNNER_TEMP/ctx"
@@ -256,12 +268,14 @@ jobs:
           printf 'FROM %s\nCOPY --from=%s:hushrun-linux-x64-latest /hushrun /hushrun\n%s\n' "$RUST_IMAGE" "$IMAGE" "$base" > "$ctx/Dockerfile.deps"
           # The full store, unsigned: read on the person's say-so, as a store from a machine is.
           printf 'FROM %s\nCOPY --from=%s:hushrun-linux-x64-branch-main-latest /hushrun /hushrun\n%s\nENV HUSHRUN_BUILD_LOWER_UNTRUSTED=1\n' "$RUST_IMAGE" "$IMAGE" "$base" > "$ctx/Dockerfile.full"
+          # The full store again, with HOME and CARGO_HOME where GitHub's runner has them (B-76).
+          { cat "$ctx/Dockerfile.full"; echo 'RUN mkdir -p /home/runner/.cargo'; echo 'ENV HOME=/home/runner CARGO_HOME=/home/runner/.cargo'; } > "$ctx/Dockerfile.paths"
           sed -i 's/^ *//' "$ctx"/Dockerfile.*
-          for v in cold deps full; do echo "== Dockerfile.$v"; cat "$ctx/Dockerfile.$v"; docker build -q -t "hushrun-snap-gh-$v" -f "$ctx/Dockerfile.$v" "$ctx"; done
+          for v in cold deps full paths; do echo "== Dockerfile.$v"; cat "$ctx/Dockerfile.$v"; docker build -q -t "hushrun-snap-gh-$v" -f "$ctx/Dockerfile.$v" "$ctx"; done
 
       - name: Boot cold, warm from the dependencies, warm from the full store
         run: |
-          for v in cold deps full; do
+          for v in cold deps full paths; do
             echo "::group::$v"
             start=$(date +%s.%N)
             docker run --rm --name "hushrun-snap-gh-$v" "hushrun-snap-gh-$v" /boot.sh 2>&1 | tee "$RUNNER_TEMP/$v.log"
@@ -272,7 +286,7 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          for v in cold deps full; do
+          for v in cold deps full paths; do
             { echo "### $v"; echo '```'; grep -E 'hushrun: build|baked|wall seconds|Finished' "$RUNNER_TEMP/$v.log" || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           done
 
