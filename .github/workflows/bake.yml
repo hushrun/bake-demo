@@ -168,7 +168,7 @@ jobs:
           digest="sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)"
           echo "digest=$digest" >> "$GITHUB_ENV"
           printf '%s' "$raw" | jq '{mediaType, layers: [.layers[] | {digest, size, role: .annotations["dev.hushrun.layer"]}]}'
-          cosign verify-attestation --new-bundle-format --insecure-ignore-tlog \
+          cosign verify-attestation --new-bundle-format --insecure-ignore-tlog --use-signed-timestamps \
             --type https://hushrun.com/attestations/baked-image/v1 \
             --certificate-identity-regexp "$IDENTITY" \
             --certificate-oidc-issuer "$ISSUER" \
@@ -177,7 +177,7 @@ jobs:
 
       - name: The same check must fail for another identity
         run: |
-          if cosign verify-attestation --new-bundle-format --insecure-ignore-tlog \
+          if cosign verify-attestation --new-bundle-format --insecure-ignore-tlog --use-signed-timestamps \
             --type https://hushrun.com/attestations/baked-image/v1 \
             --certificate-identity-regexp '^https://github\.com/hushrun/bake-demo/\.github/workflows/bake\.yml@refs/heads/other$' \
             --certificate-oidc-issuer "$ISSUER" \
@@ -196,7 +196,7 @@ jobs:
           ls -la "$RUNNER_TEMP/pulled"
           du -sh "$RUNNER_TEMP/pulled"
           jq 'del(.packs, .rows)' "$RUNNER_TEMP/pulled/baked.json"
-          cosign verify-blob-attestation --new-bundle-format --insecure-ignore-tlog \
+          cosign verify-blob-attestation --new-bundle-format --insecure-ignore-tlog --use-signed-timestamps \
             --bundle "$RUNNER_TEMP/pulled/baked.sigstore.json" \
             --type https://hushrun.com/attestations/baked-store/v1 \
             --certificate-identity-regexp "$IDENTITY" \
@@ -270,12 +270,14 @@ jobs:
           printf 'FROM %s\nCOPY --from=%s:hushrun-linux-x64-branch-main-latest /hushrun /hushrun\n%s\nENV HUSHRUN_BUILD_LOWER_UNTRUSTED=1\n' "$RUST_IMAGE" "$IMAGE" "$base" > "$ctx/Dockerfile.full"
           # The full store again, with HOME and CARGO_HOME where GitHub's runner has them (B-76).
           { cat "$ctx/Dockerfile.full"; echo 'RUN mkdir -p /home/runner/.cargo'; echo 'ENV HOME=/home/runner CARGO_HOME=/home/runner/.cargo'; } > "$ctx/Dockerfile.paths"
+          # ...and the toolchain where the runner's rustup keeps it too.
+          { cat "$ctx/Dockerfile.paths"; echo 'RUN cp -a /usr/local/rustup /home/runner/.rustup'; echo 'ENV RUSTUP_HOME=/home/runner/.rustup'; } > "$ctx/Dockerfile.rustup"
           sed -i 's/^ *//' "$ctx"/Dockerfile.*
-          for v in cold deps full paths; do echo "== Dockerfile.$v"; cat "$ctx/Dockerfile.$v"; docker build -q -t "hushrun-snap-gh-$v" -f "$ctx/Dockerfile.$v" "$ctx"; done
+          for v in cold deps full paths rustup; do echo "== Dockerfile.$v"; cat "$ctx/Dockerfile.$v"; docker build -q -t "hushrun-snap-gh-$v" -f "$ctx/Dockerfile.$v" "$ctx"; done
 
       - name: Boot cold, warm from the dependencies, warm from the full store
         run: |
-          for v in cold deps full paths; do
+          for v in cold deps full paths rustup; do
             echo "::group::$v"
             start=$(date +%s.%N)
             docker run --rm --name "hushrun-snap-gh-$v" "hushrun-snap-gh-$v" /boot.sh 2>&1 | tee "$RUNNER_TEMP/$v.log"
@@ -286,7 +288,7 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          for v in cold deps full paths; do
+          for v in cold deps full paths rustup; do
             { echo "### $v"; echo '```'; grep -E 'hushrun: build|baked|wall seconds|Finished' "$RUNNER_TEMP/$v.log" || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           done
 
