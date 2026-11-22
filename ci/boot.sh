@@ -8,7 +8,7 @@ hushrun build status 2>&1 || true
 # Crates are downloaded before the clock starts, so both containers time compiling alone.
 cargo fetch --locked -q
 # The one-file change a sandbox makes before it builds.
-sed -i 's/Prints the `key=value` pairs of a text as JSON./Prints the `key=value` pairs of a text, as JSON./' src/main.rs
+echo '// changed in the sandbox' >> src/main.rs
 git diff --stat
 start=$(date +%s.%N)
 HUSHRUN_BUILD=on hushrun run build -- cargo build --release --locked
